@@ -5,8 +5,10 @@ from importlib.resources import files
 
 import hydra
 from omegaconf import OmegaConf
+import sys
+sys.path.append('/home/mas/F5-TTS-distill/src')
 
-from f5_tts.model import CFM, Trainer
+from f5_tts.model import CFM, Trainer, MeanFlowTTS
 from f5_tts.model.dataset import load_dataset
 from f5_tts.model.utils import get_tokenizer
 
@@ -32,7 +34,7 @@ def main(model_cfg):
     vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
 
     # set model
-    model = CFM(
+    model = MeanFlowTTS(
         transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
@@ -53,7 +55,7 @@ def main(model_cfg):
         grad_accumulation_steps=model_cfg.optim.grad_accumulation_steps,
         max_grad_norm=model_cfg.optim.max_grad_norm,
         logger=model_cfg.ckpts.logger,
-        wandb_project="CFM-TTS",
+        wandb_project="MeanFlowTTS-TTS",
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_updates=model_cfg.ckpts.last_per_updates,

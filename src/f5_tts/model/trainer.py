@@ -19,8 +19,16 @@ from f5_tts.model import CFM
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
+import numpy as np
+from collections import OrderedDict
 
 # trainer
+try:
+    import comet_ml
+    COMET_ML_AVAILABLE = True
+except ImportError:
+    COMET_ML_AVAILABLE = False
+    print("Comet ML not installed. Install with: pip install comet-ml")
 
 
 class Trainer:
@@ -44,6 +52,14 @@ class Trainer:
         wandb_project="test_f5-tts",
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
+        # Comet ML specific parameters
+        comet_project_name="f5-tts",
+        comet_experiment_name="test_run",
+        comet_api_key: str = None,  # Can also be set via COMET_API_KEY env var
+        comet_workspace: str = None,  # Can also be set via COMET_WORKSPACE env var
+        comet_disabled: bool = False,
+        comet_offline: bool = False,
+        comet_resume_id: str = None,
         log_samples: bool = False,
         last_per_updates=None,
         accelerate_kwargs: dict = dict(),
@@ -52,23 +68,102 @@ class Trainer:
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
-        model_cfg_dict: dict = dict(),  # training config
+        model_cfg_dict: dict = dict(),  # training config,
+        log_gradients: bool = True,  # Add this parameter
+        log_gradient_steps: int = 100,  # Log gradients every N steps
+        gradient_layers_to_log=[
+            "t_embedder.mlp.2.weight",
+            "r_embedder.mlp.2.weight",
+            "transformer_blocks.0.attn.to_qkv.weight",
+            "transformer_blocks.10.attn.to_qkv.weight",
+            "transformer_blocks.21.attn.to_qkv.weight",
+            "proj_out.weight",
+        ],
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
+        self.log_gradients = log_gradients
+        self.log_gradient_steps = log_gradient_steps
+        self.gradient_layers_to_log = gradient_layers_to_log
+        # Handle logger initialization
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
+        elif logger == "comet" and not COMET_ML_AVAILABLE:
+            print("Comet ML not available, falling back to no logging")
+            logger = None
+
         self.log_samples = log_samples
 
         self.accelerator = Accelerator(
-            log_with=logger if logger == "wandb" else None,
+            log_with=None,  # We'll handle logging manually for Comet ML
             kwargs_handlers=[ddp_kwargs],
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
 
         self.logger = logger
-        if self.logger == "wandb":
+        # Initialize Comet ML experiment
+        self.comet_experiment = None
+        if self.logger == "comet" and self.is_main:
+            if comet_offline:
+                self.comet_experiment = comet_ml.OfflineExperiment(
+                    project_name=comet_project_name,
+                    workspace=comet_workspace,
+                    api_key=comet_api_key,
+                    disabled=comet_disabled,
+                    display_summary_level=0,  # Disable auto-logging summary
+                    auto_metric_logging=True,
+                    auto_param_logging=True,
+                    auto_histogram_weight_logging=False,
+                    auto_histogram_gradient_logging=False,
+                    auto_histogram_activation_logging=False,
+                )
+            else:
+                if comet_resume_id:
+                    # Resume existing experiment
+                    self.comet_experiment = comet_ml.ExistingExperiment(
+                        api_key=comet_api_key,
+                        previous_experiment=comet_resume_id,
+                        workspace=comet_workspace,
+                        project_name=comet_project_name,
+                        disabled=comet_disabled,
+                    )
+                else:
+                    # Create new experiment
+                    self.comet_experiment = comet_ml.Experiment(
+                        api_key=comet_api_key,
+                        workspace=comet_workspace,
+                        project_name=comet_project_name,
+                        disabled=comet_disabled,
+                        display_summary_level=0,
+                        auto_metric_logging=True,
+                        auto_param_logging=True,
+                        auto_histogram_weight_logging=False,
+                        auto_histogram_gradient_logging=False,
+                        auto_histogram_activation_logging=False,
+                    )
+                    self.comet_experiment.set_name(comet_experiment_name)
+            
+            # Log hyperparameters
+            if not model_cfg_dict:
+                model_cfg_dict = {
+                    "epochs": epochs,
+                    "learning_rate": learning_rate,
+                    "num_warmup_updates": num_warmup_updates,
+                    "batch_size_per_gpu": batch_size_per_gpu,
+                    "batch_size_type": batch_size_type,
+                    "max_samples": max_samples,
+                    "grad_accumulation_steps": grad_accumulation_steps,
+                    "max_grad_norm": max_grad_norm,
+                    "noise_scheduler": noise_scheduler,
+                }
+            model_cfg_dict["gpus"] = self.accelerator.num_processes
+            self.comet_experiment.log_parameters(model_cfg_dict)
+            
+            # Log model architecture
+            self.comet_experiment.set_model_graph(str(model))
+
+        elif self.logger == "wandb":
             if exists(wandb_resume_id):
                 init_kwargs = {"wandb": {"resume": "allow", "name": wandb_run_name, "id": wandb_resume_id}}
             else:
@@ -140,9 +235,170 @@ class Trainer:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
+    def get_gradient_stats(self, model):
+        """Calculate gradient statistics for the model"""
+        grad_stats = OrderedDict()
+        total_norm = 0.0
+        param_count = 0
+        
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.data
+                grad_norm = grad.norm(2).item()
+                total_norm += grad_norm ** 2
+                param_count += param.numel()
+                
+                # Calculate statistics
+                grad_stats[name] = {
+                    'mean': grad.mean().item(),
+                    'std': grad.std().item(),
+                    'max': grad.max().item(),
+                    'min': grad.min().item(),
+                    'norm': grad_norm,
+                }
+        
+        total_norm = np.sqrt(total_norm)
+        grad_stats['total_gradient_norm'] = total_norm
+        grad_stats['average_gradient_norm'] = total_norm / np.sqrt(param_count) if param_count > 0 else 0
+        
+        return grad_stats
+
+    def select_layers_to_log(self, model):
+        """Auto-select important layers for MeanFlowDiT"""
+        selected_layers = []
+        
+        # Priority 1: Time embedders (critical for MeanFlow)
+        for name, _ in model.named_parameters():
+            if 't_embedder' in name or 'r_embedder' in name:
+                if 'weight' in name and len(selected_layers) < 2:
+                    selected_layers.append(name)
+        
+        # Priority 2: First and last transformer blocks
+        transformer_blocks = []
+        for name, _ in model.named_parameters():
+            if 'transformer_blocks' in name and 'to_qkv.weight' in name:
+                transformer_blocks.append(name)
+        
+        if transformer_blocks:
+            selected_layers.append(transformer_blocks[0])  # First block
+            selected_layers.append(transformer_blocks[len(transformer_blocks)//2])  # Middle block
+            selected_layers.append(transformer_blocks[-1])  # Last block
+        
+        # Priority 3: Output layers
+        for name, _ in model.named_parameters():
+            if 'proj_out.weight' in name or 'norm_out.linear.weight' in name:
+                selected_layers.append(name)
+                break
+        
+        return selected_layers[:8]  # Limit to 8 most important layers
+
+    def log_gradients_to_logger(self, grad_stats, step, selected_layers=None):
+        """Log gradient statistics to the active logger"""
+        if not self.accelerator.is_local_main_process:
+            return
+            
+        # Log overall gradient norm
+        overall_metrics = {
+            'gradients/total_norm': grad_stats['total_gradient_norm'],
+            'gradients/average_norm': grad_stats['average_gradient_norm'],
+        }
+        
+        # Log selected layer gradients
+        if selected_layers:
+            for layer_name in selected_layers:
+                if layer_name in grad_stats:
+                    layer_stats = grad_stats[layer_name]
+                    layer_metrics = {
+                        f'gradients/{layer_name}/mean': layer_stats['mean'],
+                        f'gradients/{layer_name}/std': layer_stats['std'],
+                        f'gradients/{layer_name}/norm': layer_stats['norm'],
+                    }
+                    overall_metrics.update(layer_metrics)
+        
+        # Log to the appropriate logger
+        if self.logger == "comet" and self.comet_experiment:
+            self.comet_experiment.log_metrics(overall_metrics, step=step)
+            
+            # Log gradient histograms for selected layers
+            for layer_name in selected_layers:
+                if layer_name in grad_stats:
+                    # Get the actual gradient tensor for histogram
+                    for name, param in self.model.named_parameters():
+                        if name == layer_name and param.grad is not None:
+                            grad_numpy = param.grad.data.cpu().numpy().flatten()
+                            self.comet_experiment.log_histogram_3d(
+                                grad_numpy,
+                                name=f'gradient_hist/{layer_name}',
+                                step=step,
+                            )
+                            break
+                            
+        elif self.logger == "wandb":
+            import wandb
+            wandb.log(overall_metrics, step=step)
+            
+            # Log gradient histograms
+            for layer_name in selected_layers:
+                if layer_name in grad_stats:
+                    for name, param in self.model.named_parameters():
+                        if name == layer_name and param.grad is not None:
+                            grad_numpy = param.grad.data.cpu().numpy().flatten()
+                            wandb.log({
+                                f'gradient_hist/{layer_name}': wandb.Histogram(grad_numpy)
+                            }, step=step)
+                            break
+                            
+        elif self.logger == "tensorboard":
+            for key, value in overall_metrics.items():
+                self.writer.add_scalar(key, value, step)
+                
+            # Log gradient histograms
+            for layer_name in selected_layers:
+                if layer_name in grad_stats:
+                    for name, param in self.model.named_parameters():
+                        if name == layer_name and param.grad is not None:
+                            self.writer.add_histogram(
+                                f'gradient_hist/{layer_name}',
+                                param.grad.data.cpu(),
+                                step
+                            )
+                            break
+
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    def log_metrics(self, metrics: dict, step: int):
+        """Unified logging method for all loggers"""
+        if self.accelerator.is_local_main_process:
+            if self.logger == "comet" and self.comet_experiment:
+                self.comet_experiment.log_metrics(metrics, step=step)
+            elif self.logger == "wandb":
+                self.accelerator.log(metrics, step=step)
+            elif self.logger == "tensorboard":
+                for key, value in metrics.items():
+                    self.writer.add_scalar(key, value, step)
+
+    def log_audio(self, audio_tensor, sample_rate, name, step):
+        """Log audio samples"""
+        if self.accelerator.is_local_main_process:
+            if self.logger == "comet" and self.comet_experiment:
+                # Save to temporary file for Comet ML
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    torchaudio.save(tmp_file.name, audio_tensor, sample_rate)
+                    self.comet_experiment.log_audio(
+                        tmp_file.name, 
+                        name=name,
+                        step=step,
+                        file_name=f"{name}_step_{step}.wav"
+                    )
+                    os.unlink(tmp_file.name)
+            elif self.logger == "wandb":
+                wandb.log({name: wandb.Audio(audio_tensor.numpy(), sample_rate=sample_rate)}, step=step)
+            elif self.logger == "tensorboard":
+                self.writer.add_audio(name, audio_tensor, step, sample_rate=sample_rate)
+
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -157,12 +413,31 @@ class Trainer:
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+                checkpoint_path = f"{self.checkpoint_path}/model_last.pt"
+                self.accelerator.save(checkpoint, checkpoint_path)
                 print(f"Saved last checkpoint at update {update}")
+                
+                # Log checkpoint to Comet ML
+                if self.logger == "comet" and self.comet_experiment:
+                    self.comet_experiment.log_model(
+                        name="model_last",
+                        file_or_folder=checkpoint_path,
+                        metadata={"update": update, "type": "last"}
+                    )
             else:
                 if self.keep_last_n_checkpoints == 0:
                     return
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{update}.pt")
+                checkpoint_path = f"{self.checkpoint_path}/model_{update}.pt"
+                self.accelerator.save(checkpoint, checkpoint_path)
+                
+                # Log checkpoint to Comet ML
+                if self.logger == "comet" and self.comet_experiment:
+                    self.comet_experiment.log_model(
+                        name=f"model_{update}",
+                        file_or_folder=checkpoint_path,
+                        metadata={"update": update, "type": "checkpoint"}
+                    )
+                
                 if self.keep_last_n_checkpoints > 0:
                     # Updated logic to exclude pretrained model from rotation
                     checkpoints = [
@@ -260,6 +535,15 @@ class Trainer:
         return update
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+        
+        if self.log_gradients:
+            selected_layers = self.select_layers_to_log(self.accelerator.unwrap_model(self.model))
+            if self.is_main:
+                print(f"Monitoring gradients for layers: {selected_layers}")
+                if self.logger == "comet" and self.comet_experiment:
+                    self.comet_experiment.log_parameter("gradient_monitored_layers", selected_layers)
+        
+
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -337,6 +621,10 @@ class Trainer:
             skipped_epoch = 0
 
         for epoch in range(skipped_epoch, self.epochs):
+            # Log epoch start
+            if self.logger == "comet" and self.comet_experiment and self.is_main:
+                self.comet_experiment.log_metric("epoch", epoch + 1, step=global_update)
+            
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
@@ -373,8 +661,16 @@ class Trainer:
                     )
                     self.accelerator.backward(loss)
 
+                    # Log gradients before clipping
+                    if self.log_gradients and global_update % self.log_gradient_steps == 0 and self.accelerator.sync_gradients:
+                        grad_stats = self.get_gradient_stats(self.model)
+                        self.log_gradients_to_logger(grad_stats, global_update, selected_layers)
+
+
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        clip_value = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        if self.logger == "comet" and self.comet_experiment:
+                            self.comet_experiment.log_metric("clip_value", clip_value, step=global_update)
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -392,6 +688,12 @@ class Trainer:
                     self.accelerator.log(
                         {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
+                    metrics = {
+                        "loss": loss.item(),
+                        "learning_rate": self.scheduler.get_last_lr()[0]
+                    }
+                    self.log_metrics(metrics, step=global_update)
+
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
@@ -426,14 +728,19 @@ class Trainer:
                                 gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
                                 ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
 
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
-                        )
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
-                        )
+                        # Save audio files
+                        gen_path = f"{log_samples_path}/update_{global_update}_gen.wav"
+                        ref_path = f"{log_samples_path}/update_{global_update}_ref.wav"
+                        torchaudio.save(gen_path, gen_audio, target_sample_rate)
+                        torchaudio.save(ref_path, ref_audio, target_sample_rate)
+
+                        self.log_audio(gen_audio, target_sample_rate, "generated_audio", global_update)
+                        self.log_audio(ref_audio, target_sample_rate, "reference_audio", global_update)
+                        
                         self.model.train()
 
         self.save_checkpoint(global_update, last=True)
-
+        # End Comet experiment
+        if self.logger == "comet" and self.comet_experiment:
+            self.comet_experiment.end()
         self.accelerator.end_training()

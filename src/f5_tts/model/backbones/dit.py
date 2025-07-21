@@ -257,3 +257,180 @@ class DiT(nn.Module):
         output = self.proj_out(x)
 
         return output
+
+
+# MeanFlow DiT - Modified for dual time inputs
+class MeanFlowDiT(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth=8,
+        heads=8,
+        dim_head=64,
+        dropout=0.1,
+        ff_mult=4,
+        mel_dim=100,
+        text_num_embeds=256,
+        text_dim=None,
+        text_mask_padding=True,
+        qk_norm=None,
+        conv_layers=0,
+        pe_attn_head=None,
+        attn_backend="torch",  # "torch" | "flash_attn" - NOTE: use "torch" for JVP compatibility
+        attn_mask_enabled=False,
+        long_skip_connection=False,
+        checkpoint_activations=False,
+    ):
+        super().__init__()
+
+        # MeanFlow modification: separate embedders for t and r
+        self.t_embedder = TimestepEmbedding(dim)
+        self.r_embedder = TimestepEmbedding(dim)
+        
+        if text_dim is None:
+            text_dim = mel_dim
+        self.text_embed = TextEmbedding(
+            text_num_embeds, text_dim, mask_padding=text_mask_padding, conv_layers=conv_layers
+        )
+        self.text_cond, self.text_uncond = None, None  # text cache
+        self.input_embed = InputEmbedding(mel_dim, text_dim, dim)
+
+        self.rotary_embed = RotaryEmbedding(dim_head)
+
+        self.dim = dim
+        self.depth = depth
+
+        # Important: Disable flash attention for JVP compatibility
+        if attn_backend == "flash_attn":
+            print("Warning: Flash attention is not compatible with JVP. Switching to torch backend.")
+            attn_backend = "torch"
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    dim=dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                    qk_norm=qk_norm,
+                    pe_attn_head=pe_attn_head,
+                    attn_backend=attn_backend,
+                    attn_mask_enabled=attn_mask_enabled,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
+
+        self.norm_out = AdaLayerNorm_Final(dim)  # final modulation
+        self.proj_out = nn.Linear(dim, mel_dim)
+
+        self.checkpoint_activations = checkpoint_activations
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Zero-out AdaLN layers in DiT blocks:
+        for block in self.transformer_blocks:
+            nn.init.constant_(block.attn_norm.linear.weight, 0)
+            nn.init.constant_(block.attn_norm.linear.bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.norm_out.linear.weight, 0)
+        nn.init.constant_(self.norm_out.linear.bias, 0)
+        nn.init.constant_(self.proj_out.weight, 0)
+        nn.init.constant_(self.proj_out.bias, 0)
+
+    def ckpt_wrapper(self, module):
+        # https://github.com/chuanyangjin/fast-DiT/blob/main/models.py
+        def ckpt_forward(*inputs):
+            outputs = module(*inputs)
+            return outputs
+
+        return ckpt_forward
+
+    def get_input_embed(
+        self,
+        x,  # b n d
+        cond,  # b n d
+        text,  # b nt
+        drop_audio_cond: bool = False,
+        drop_text: bool = False,
+        cache: bool = True,
+    ):
+        seq_len = x.shape[1]
+        if cache:
+            if drop_text:
+                if self.text_uncond is None:
+                    self.text_uncond = self.text_embed(text, seq_len, drop_text=True)
+                text_embed = self.text_uncond
+            else:
+                if self.text_cond is None:
+                    self.text_cond = self.text_embed(text, seq_len, drop_text=False)
+                text_embed = self.text_cond
+        else:
+            text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
+
+        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+
+        return x
+
+    def clear_cache(self):
+        self.text_cond, self.text_uncond = None, None
+
+    def forward(
+        self,
+        x: float["b n d"],  # noised input audio  # noqa: F722
+        t: float["b"] | float[""],  # time step t  # noqa: F821 F722
+        r: float["b"] | float[""],  # time step r (MeanFlow addition)  # noqa: F821 F722
+        cond: float["b n d"],  # masked cond audio  # noqa: F722
+        text: int["b nt"],  # text  # noqa: F722
+        mask: bool["b n"] | None = None,  # noqa: F722
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+        cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
+        cache: bool = False,
+    ):
+        batch, seq_len = x.shape[0], x.shape[1]
+        
+        # Handle scalar time inputs
+        if t.ndim == 0:
+            t = t.repeat(batch)
+        if r.ndim == 0:
+            r = r.repeat(batch)
+
+        # MeanFlow: embed both time variables separately then combine
+        t_embed = self.t_embedder(t)
+        r_embed = self.r_embedder(r)
+        time_embed = t_embed + r_embed  # Combine additively
+        
+        if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache)
+            x = torch.cat((x_cond, x_uncond), dim=0)
+            time_embed = torch.cat((time_embed, time_embed), dim=0)
+            mask = torch.cat((mask, mask), dim=0) if mask is not None else None
+        else:
+            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache)
+
+        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+
+        if self.long_skip_connection is not None:
+            residual = x
+
+        for block in self.transformer_blocks:
+            if self.checkpoint_activations:
+                # Note: Gradient checkpointing might interfere with JVP computation
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, time_embed, mask, rope, use_reentrant=False)
+            else:
+                x = block(x, time_embed, mask=mask, rope=rope)
+
+        if self.long_skip_connection is not None:
+            x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+
+        x = self.norm_out(x, time_embed)
+        output = self.proj_out(x)
+
+        return output
